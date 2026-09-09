@@ -1,0 +1,16 @@
+# Install with:  pip install pre-commit && pre-commit install
+repos:
+  - repo: local
+    hooks:
+      - id: validate-canon
+        name: validate canon (schema + references + timeline)
+        entry: python -m tools.validate
+        language: system
+        pass_filenames: false
+        files: ^canon/.*\.md$
+      - id: build-derived
+        name: rebuild derived artifacts
+        entry: python -m tools.build
+        language: system
+        pass_filenames: false
+        files: ^canon/.*\.md$

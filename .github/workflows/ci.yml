@@ -1,0 +1,45 @@
+name: canon-ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: pip install -r requirements.txt
+      - name: Check canon is canonically formatted
+        # The canon-side twin of the derived-drift gate: fails if any file is not in
+        # canonical form, so frontmatter diffs stay semantic and merges stay clean.
+        run: python -m tools.fmt --check
+      - name: Validate canon (schema, references, dependency DAG)
+        run: python -m tools.validate
+      - name: Check pending extraction plans (structure + staleness)
+        # Committed plans are repo artifacts: a schema-invalid proposal or a plan gone
+        # stale against its raw source (source_sha) fails here, not at apply time.
+        # Deliberately parked plans belong in extraction/archived/, which check ignores.
+        run: python -m tools.extract check
+      - name: Run tests
+        run: python -m pytest -q
+      - name: Rebuild deterministic derived artifacts
+        run: python -m tools.build
+      - name: Fail if deterministic derived/ is out of date
+        # Only the deterministic artifacts are byte-diffed here. Capsules are
+        # LLM-written (non-deterministic) and are gated by freshness below instead.
+        # derived/indices/ covers relations, mentions, appearances, tags, canonicity,
+        # notation, dependencies, and unintegrated.
+        run: |
+          if ! git diff --quiet -- derived/graph.json derived/indices/; then
+            echo "::error::derived/ is stale. Run 'make build' and commit the result."
+            git diff --stat -- derived/graph.json derived/indices/
+            exit 1
+          fi
+      - name: Check capsules are fresh (no LLM call)
+        # Fails the PR if canon changed but its capsule wasn't regenerated.
+        run: python -m tools.capsules --check

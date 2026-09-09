@@ -1,0 +1,175 @@
+name: pr-validation
+
+# The PR-facing companion to ci.yml: same gate, run against pull requests targeting
+# main, plus a diff-scoped annotation comment (tools/pr_annotate.py, with tools/impact's
+# "## Impact" section appended) so a reviewer sees what the PR actually touches without
+# reading the whole-canon validate output. This does not replace ci.yml — it is a second
+# trigger surface (pull_request, vs. push+pull_request there) with the same checks plus
+# the annotation step layered on top.
+#
+# One more, optional step at the end: the LLM canon-check (tools/canon_check.py). It
+# only runs when the ANTHROPIC_API_KEY secret is configured (a fork PR never has it —
+# GitHub withholds repo secrets from fork-triggered pull_request workflows — so this
+# degrades to a silent skip there too, same as the annotation-comment step below already
+# does for a different reason). It is advisory on top of an advisory: continue-on-error
+# is set, and tools/canon_check.py itself always exits 0 outside --strict (never passed
+# in CI) — so this step can never fail the job, only add a second PR comment section.
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  validate-and-annotate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history (not just the PR branch tip) so `origin/<base>` is resolvable
+          # locally for both the derived-drift diff below and tools/pr_annotate's own
+          # `git diff --name-status <base>`.
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: pip install -r requirements.txt
+      - name: Check canon is canonically formatted
+        run: python -m tools.fmt --check
+      - name: Validate canon (schema, references, dependency DAG)
+        run: python -m tools.validate
+      - name: Check pending extraction plans (structure + staleness)
+        # Committed plans are repo artifacts: a schema-invalid proposal or a plan gone
+        # stale against its raw source (source_sha) fails here, not at apply time.
+        # Deliberately parked plans belong in extraction/archived/, which check ignores.
+        run: python -m tools.extract check
+      - name: Run tests
+        run: python -m pytest -q
+      - name: Rebuild deterministic derived artifacts
+        run: python -m tools.build
+      - name: Fail if deterministic derived/ is out of date
+        run: |
+          if ! git diff --quiet -- derived/graph.json derived/indices/; then
+            echo "::error::derived/ is stale. Run 'make build' and commit the result."
+            git diff --stat -- derived/graph.json derived/indices/
+            exit 1
+          fi
+      - name: Check capsules are fresh (no LLM call)
+        run: python -m tools.capsules --check
+
+      - name: Generate PR annotation report
+        # Runs regardless of whether the gate above passed — the annotation is diagnostic,
+        # not another gate, so a reviewer gets it even (especially) when something failed.
+        # A fallback message is written on any pr_annotate failure (e.g. an unexpectedly
+        # shallow checkout) so the comment step below always has a file to post.
+        if: always()
+        run: |
+          python -m tools.pr_annotate --base "origin/${{ github.event.pull_request.base.ref }}" \
+            > pr_annotate_report.md \
+            || echo "pr_annotate failed to run; see the workflow logs for this run." > pr_annotate_report.md
+
+      - name: Post or update the PR annotation comment
+        # Guarded, not just continue-on-error: a fork PR's GITHUB_TOKEN is read-only no
+        # matter what `permissions:` above declares, so this would 403 on every fork PR.
+        # The `if:` skips that noisily; continue-on-error is kept as a second safety net
+        # for any other permission surprise (e.g. org policy) so the job never fails on
+        # account of the comment step alone — the gate above is the thing that must fail.
+        if: always() && github.event.pull_request.head.repo.full_name == github.repository
+        continue-on-error: true
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const marker = '<!-- mathops-pr-annotate -->';
+            const body = marker + '\n' + fs.readFileSync('pr_annotate_report.md', 'utf8');
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            const existing = comments.find(c => c.body && c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }
+
+      - name: Check whether the ANTHROPIC_API_KEY secret is configured
+        # `if:` conditions can't reference `secrets.*` directly (GitHub Actions disallows
+        # it), so the boolean lives in an `env:` var here and is read back via
+        # `steps.<id>.outputs.has_key` by the two steps below. Runs unconditionally
+        # (always(), no dependency on the gate above) since it's just a cheap read of
+        # whether a secret exists, not a check of anything the gate already covers.
+        id: canon_check_gate
+        if: always()
+        env:
+          HAS_KEY: ${{ secrets.ANTHROPIC_API_KEY != '' }}
+        run: echo "has_key=$HAS_KEY" >> "$GITHUB_OUTPUT"
+
+      - name: Run LLM canon-check (advisory; needs ANTHROPIC_API_KEY)
+        # Skips silently (no key -> has_key == 'false') rather than failing: this is the
+        # opt-in half of the continuity-check pipeline, not a gate requirement. Uses the
+        # metered API backend (there is no Claude subscription available to a CI runner);
+        # continue-on-error is a second safety net alongside tools/canon_check.py's own
+        # advisory exit-0-always behavior (--strict is never passed here).
+        id: canon_check_run
+        if: always() && steps.canon_check_gate.outputs.has_key == 'true'
+        continue-on-error: true
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          python -m tools.canon_check --base "origin/${{ github.event.pull_request.base.ref }}" \
+            --backend api \
+            > canon_check_report.md \
+            || echo "canon-check failed to run; see the workflow logs for this run." > canon_check_report.md
+
+      - name: Post or update the canon-check PR comment
+        # Same marker-keyed update-in-place pattern as the pr_annotate comment above, as a
+        # second, independent marker section — appending to that comment (rather than
+        # editing it) would race the two steps against each other's read-modify-write of
+        # the same comment body; a second marker + a second github-script call keeps them
+        # independent, at the cost of two comments instead of one on a PR that has both.
+        if: >-
+          always() && steps.canon_check_gate.outputs.has_key == 'true' &&
+          github.event.pull_request.head.repo.full_name == github.repository
+        continue-on-error: true
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const marker = '<!-- mathops-canon-check -->';
+            const body = marker + '\n' + fs.readFileSync('canon_check_report.md', 'utf8');
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            const existing = comments.find(c => c.body && c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }
