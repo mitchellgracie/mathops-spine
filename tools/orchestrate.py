@@ -53,17 +53,36 @@ ORCH_MODEL = "claude-sonnet-5"
 
 # --- roles -------------------------------------------------------------------
 
+# Every content tree a proposal-only (``edits_canon=False``) role could corrupt. The
+# no-edit guard (:func:`run_no_edit_guard`) watches all of them and each role's
+# *declared write surface* is carved back out via ``Role.watch_excludes`` — deny by
+# default, so a content tree is watched unless a role explicitly claims it. The watch
+# is deliberately wider than the original ``canon/``+``expositions/`` pair: a stray
+# write to ``derived/`` (hand-edited compiled output), ``extraction/`` (a plan pushed
+# past its human gate) or ``raw/`` (source material reworded by its own extractor) is
+# exactly as much a violation as an edited theorem (.docs/TEAM.md, WP-B).
+NO_EDIT_WATCH_PATHS: tuple[str, ...] = (
+    "canon/", "expositions/", "derived/", "extraction/", "raw/",
+)
+
+
 @dataclass(frozen=True)
 class Role:
-    """A knowledge-base role: its system-prompt file and whether it edits canon.
+    """A knowledge-base role: its system-prompt file and how its safety gate is scoped.
 
     ``edits_canon`` is what drives the safety gate — the Curator mutates ``canon/``;
-    the Drafter, Consistency Editor, and Extractor only propose (raw material, notes,
-    plans), so they ride the read-only guard instead.
+    every other role only proposes (raw material, notes, plans), so it rides the
+    read-only guard instead. For those proposal-only roles ``watch_excludes`` names
+    the role's declared write surface *within* :data:`NO_EDIT_WATCH_PATHS` — the one
+    place its output legitimately lands (the Drafter's ``raw/drafts/``, the
+    Consistency Editor's ``derived/editor-notes/``…) — which the guard subtracts from
+    the watch rather than reverting the role's own deliverable. Unused when
+    ``edits_canon`` is True.
     """
     name: str
     prompt_file: str
     edits_canon: bool
+    watch_excludes: tuple[str, ...] = ()
 
 
 ROLES: dict[str, Role] = {
@@ -71,16 +90,29 @@ ROLES: dict[str, Role] = {
     # merges duplicates, keeps statuses and the dependency graph honest.
     "curator":            Role("curator", "curator.md", edits_canon=True),
     # The Drafter writes prose — proof attempts, exposition drafts — as raw material
-    # under raw/, never directly into canon or expositions (CLAUDE.md rule 9).
-    "drafter":            Role("drafter", "drafter.md", edits_canon=False),
+    # under raw/drafts/, never directly into canon or expositions (CLAUDE.md rule 9);
+    # its close-the-loop step proposes a plan under extraction/plans/.
+    "drafter":            Role("drafter", "drafter.md", edits_canon=False,
+                               watch_excludes=("raw/drafts/", "extraction/plans/")),
     # The Consistency Editor is the notation-drift and restated-theorem police; its
-    # output is advisory notes (tools.editor), never edits.
+    # output is advisory notes (tools.editor) in derived/editor-notes/, never edits.
     "consistency-editor": Role("consistency-editor", "consistency-editor.md",
-                               edits_canon=False),
+                               edits_canon=False,
+                               watch_excludes=("derived/editor-notes/",)),
     # The Extractor proposes; it never mutates. Its whole output is a plan file under
-    # extraction/plans/ (tools.extract), so it rides the same no-edit guard as the
-    # other edits_canon=False roles.
-    "extractor":          Role("extractor", "extractor.md", edits_canon=False),
+    # extraction/plans/ (tools.extract) — the raw/ document it reads stays watched,
+    # because rewording source material is a violation too.
+    "extractor":          Role("extractor", "extractor.md", edits_canon=False,
+                               watch_excludes=("extraction/plans/",)),
+    # The Researcher (RESEARCHER-stream principal, .docs/TEAM.md): explores attacks,
+    # proposes conjectures and connections, drafts survey material. Its entire output
+    # is raw material under raw/, plus extract-plan runs on its own drafts.
+    "researcher":         Role("researcher", "researcher.md", edits_canon=False,
+                               watch_excludes=("raw/", "extraction/plans/")),
+    # The Referee attacks a draft argument step-by-step against its dependencies;
+    # read-only by design — its critique is a note under raw/sessions/, never an edit.
+    "referee":            Role("referee", "referee.md", edits_canon=False,
+                               watch_excludes=("raw/sessions/",)),
 }
 
 
@@ -342,15 +374,6 @@ def run_make_check(*, cwd: Path = ROOT, run=None) -> tuple[bool, str]:
     return ok, ((result.stdout or "") + (result.stderr or "")).strip()
 
 
-# Paths a read-only role (Drafter, Consistency Editor, Extractor) must never touch.
-# canon/ is read-only truth to these roles, and expositions/ is written only by the
-# extraction pipeline's deterministic apply step — a Drafter's output is raw material
-# under raw/, reaching expositions/ via human triage (CLAUDE.md rule 9,
-# agents/drafter.md). Both trees are watched, not just canon/, because a role placing
-# or rewriting a writeup directly is exactly the kind of out-of-scope edit this guard
-# exists to catch.
-NO_EDIT_WATCH_PATHS: tuple[str, ...] = ("canon/", "expositions/")
-
 # Where the guard quarantines the content it is about to undo (see run_no_edit_guard).
 # Lives at the repo root, deliberately *outside* the watched paths so the salvage copy
 # itself can never re-trip the guard; gitignored so it never dirties a commit.
@@ -405,30 +428,64 @@ def _salvage_dirty_paths(cwd: Path, dirty: str) -> Path | None:
     return dest_root if copied else None
 
 
+def _split_status_paths(porcelain: str) -> tuple[list[str], list[str]]:
+    """Split porcelain v1 output into (tracked, untracked) paths for the restore step.
+
+    Same line grammar as :func:`_salvage_dirty_paths` (two status chars + space, rename
+    arrows, best-effort quote stripping); kept separate because the two consumers want
+    different shapes — salvage copies whatever is on disk, the restore must route
+    tracked paths to ``git checkout`` and untracked ones (status code ``??``) to
+    ``git clean``.
+    """
+    tracked: list[str] = []
+    untracked: list[str] = []
+    for line in porcelain.splitlines():
+        if len(line) < 4 or not line.strip():
+            continue
+        code, raw = line[:2], line[3:]
+        if " -> " in raw:  # rename: restore the right-hand side, where the content is
+            raw = raw.split(" -> ", 1)[1]
+        rel = raw.strip().strip('"')
+        (untracked if code == "??" else tracked).append(rel)
+    return tracked, untracked
+
+
 def run_no_edit_guard(*, cwd: Path = ROOT, run=None,
-                      paths: tuple[str, ...] = NO_EDIT_WATCH_PATHS) -> tuple[bool, str]:
+                      paths: tuple[str, ...] = NO_EDIT_WATCH_PATHS,
+                      excludes: tuple[str, ...] = ()) -> tuple[bool, str]:
     """The inverse of :func:`run_make_check`: a read-only role must leave no git trace.
 
     Where the canon safety gate asks "did this canon-editing task leave canon valid?",
-    this asks "did this *read-only* task (``edits_canon=False``) touch
-    canon/expositions at all?" It exists because ``runner`` may, in the ``cli``
+    this asks "did this *read-only* task (``edits_canon=False``) touch any watched
+    content tree at all?" It exists because ``runner`` may, in the ``cli``
     backend, be a real ``claude -p`` subprocess that — depending on the caller's tool
     permissions — could use file-editing tools despite its role prompt saying not to; a
     prose instruction is not a mechanical guarantee, so this checks the working tree
     instead of trusting the prompt.
 
+    ``excludes`` subtracts the role's declared write surface (``Role.watch_excludes``)
+    from the watch, as git ``:(exclude)`` pathspecs on both the status check and the
+    restore. Subtraction, not a narrower ``paths`` list, on purpose: the watch stays
+    deny-by-default (a new subtree of ``derived/`` is watched the day it appears),
+    and the guard can never revert a role's own legitimate deliverable — the
+    incident-shaped case being the Consistency Editor, whose advisory notes live in
+    ``derived/editor-notes/`` while the rest of ``derived/`` stays off-limits to it.
+
     A non-empty scoped ``git status --porcelain`` (tracked modifications/deletions *and*
     untracked new files — a stray new file is exactly as much a violation as an edited
     one) means the role wrote where it should not have. The violation is undone two ways:
     ``git checkout --`` restores every tracked path git status reported, and ``git clean
-    -fd --`` removes any untracked file/directory it left behind — together, a full
-    restore of the watched paths, not just the tracked-file half of it. Both restore
-    commands are given only the watched paths that actually exist on disk: unlike
-    ``git status``, ``git checkout --`` and ``git clean --`` *error out entirely* on a
-    pathspec that matches nothing, which would otherwise abort the restore of the
-    *other*, real violation alongside it. ``run`` is injected so tests exercise real
-    git against a disposable temp repo rather than faking subprocess output (git's own
-    status/checkout semantics are the thing under test).
+    -fd --`` removes every untracked file/directory it reported. Both restore commands
+    are given the *exact paths the status call reported*, never the watched roots:
+    the status is the one command that reliably applies the ``:(exclude)`` scoping
+    (``git clean`` in particular does not honor exclude pathspec magic, and cleaning
+    a whole root would delete the role's legitimate deliverable alongside the
+    violation), and a reported path necessarily matches something — so the
+    pathspec-matches-nothing failure mode of ``git checkout --``/``git clean --``,
+    which would abort the restore of a *real* violation listed alongside, cannot
+    arise. ``run`` is injected so tests exercise real git against a disposable temp
+    repo rather than faking subprocess output (git's own status/checkout semantics
+    are the thing under test).
 
     The restore never *destroys* content: everything it is about to discard is first
     copied into a gitignored quarantine (see :func:`_salvage_dirty_paths` for the
@@ -436,7 +493,13 @@ def run_no_edit_guard(*, cwd: Path = ROOT, run=None,
     human can recover legitimate work the guard caught by mistake.
     """
     _run = run or subprocess.run
-    status = _run(["git", "status", "--porcelain", "--", *paths],
+    exclude_specs = [f":(exclude){e}" for e in excludes]
+    # -uall lists untracked files individually instead of collapsing a wholly
+    # untracked directory to one "dir/" line. That matters twice: the excludes filter
+    # per *file* (a collapsed "derived/" line would smuggle an excluded
+    # derived/editor-notes/ file into the violation set), and the restore below
+    # cleans exactly the reported paths, so those must be files, not umbrella dirs.
+    status = _run(["git", "status", "--porcelain", "-uall", "--", *paths, *exclude_specs],
                   cwd=str(cwd), capture_output=True, text=True)
     dirty = (status.stdout or "").strip()
     if not dirty:
@@ -445,10 +508,11 @@ def run_no_edit_guard(*, cwd: Path = ROOT, run=None,
     # Parse the raw (unstripped) stdout: porcelain's two status chars can start with a
     # space (" M "), which the display-oriented strip() above would eat off line one.
     salvage = _salvage_dirty_paths(Path(cwd), status.stdout or "")
-    present = [p for p in paths if (Path(cwd) / p.rstrip("/")).exists()]
-    if present:
-        _run(["git", "checkout", "--", *present], cwd=str(cwd), capture_output=True, text=True)
-        _run(["git", "clean", "-fd", "--", *present], cwd=str(cwd), capture_output=True, text=True)
+    tracked, untracked = _split_status_paths(status.stdout or "")
+    if tracked:
+        _run(["git", "checkout", "--", *tracked], cwd=str(cwd), capture_output=True, text=True)
+    if untracked:
+        _run(["git", "clean", "-fd", "--", *untracked], cwd=str(cwd), capture_output=True, text=True)
     where = f"; discarded content salvaged to {salvage}" if salvage else ""
     return False, f"read-only role modified {', '.join(paths)} (restored{where}):\n{dirty}"
 
@@ -493,7 +557,7 @@ def run(
     assemble: Callable[..., str] = _default_assemble,
     load_prompt: Callable[[str], str] = load_role_prompt,
     check: Callable[[], tuple[bool, str]] = run_make_check,
-    enforce_no_edits: Callable[[], tuple[bool, str]] = run_no_edit_guard,
+    enforce_no_edits: Callable[..., tuple[bool, str]] = run_no_edit_guard,
 ) -> RunReport:
     """Execute the DAG in a deterministic topological order, sequentially, in-process.
 
@@ -502,9 +566,10 @@ def run(
     of two safety gates runs, chosen by the role's ``edits_canon`` flag: a canon-editing
     task runs ``check`` (``make check``; a red gate is a task failure); a read-only task
     instead runs ``enforce_no_edits`` — the inverse check (:func:`run_no_edit_guard`)
-    that the task left ``canon/``/``expositions/`` untouched. Either gate failing halts
-    the run — remaining tasks are marked skipped rather than dispatched on top of broken
-    canon or an unenforced read-only violation.
+    that the task left every watched content tree untouched, called with the role's
+    ``watch_excludes`` so its own declared write surface is exempt. Either gate failing
+    halts the run — remaining tasks are marked skipped rather than dispatched on top of
+    broken canon or an unenforced read-only violation.
 
     ``runner``, ``assemble``, ``load_prompt``, ``check`` and ``enforce_no_edits`` are
     all injected so this runs fully offline under test.
@@ -542,7 +607,8 @@ def run(
                 halted = True
                 continue
         else:
-            guard_ok, detail = enforce_no_edits()
+            guard_ok, detail = enforce_no_edits(
+                excludes=ROLES[task.role].watch_excludes)
             if not guard_ok:
                 report.outcomes.append(TaskOutcome(
                     tid, "failed", output=output,
