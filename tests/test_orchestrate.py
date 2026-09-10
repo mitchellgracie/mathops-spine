@@ -58,7 +58,7 @@ def run(dag, runner, **kw):
     kw.setdefault("assemble", fake_assemble)
     kw.setdefault("load_prompt", fake_prompt)
     kw.setdefault("check", lambda: (True, ""))
-    kw.setdefault("enforce_no_edits", lambda: (True, ""))
+    kw.setdefault("enforce_no_edits", lambda **_: (True, ""))
     return orch.run(dag, runner, **kw)
 
 
@@ -254,7 +254,7 @@ def test_read_only_guard_failure_halts_run():
     dag.validate()
 
     report = run(dag, RecordingRunner("out"),
-                 enforce_no_edits=lambda: (False, "drafter wrote into canon/"))
+                 enforce_no_edits=lambda **_: (False, "drafter wrote into canon/"))
     assert not report.ok()
     outcomes = {o.task_id: o.status for o in report.outcomes}
     assert outcomes == {"draft": "failed", "check": "skipped"}
@@ -320,10 +320,39 @@ def test_role_registry_gates_are_correctly_assigned():
     # The curator is the one canon-editing role; the proposal-only roles ride the
     # read-only guard, and every registered role has a non-empty prompt file.
     assert orch.ROLES["curator"].edits_canon
-    for name in ("drafter", "consistency-editor", "extractor"):
+    for name in ("drafter", "consistency-editor", "extractor", "researcher", "referee"):
         assert not orch.ROLES[name].edits_canon
     for name in orch.ROLES:
         assert orch.load_role_prompt(name).strip()  # prompt file exists and is non-empty
+
+
+def test_watch_excludes_name_surfaces_inside_the_watch_paths():
+    # A role's declared write surface only means anything if the guard actually
+    # watches the tree it is carved out of: an exclude outside NO_EDIT_WATCH_PATHS is
+    # a typo (a surface nobody watches), and a canon-editing role has no use for one.
+    for role in orch.ROLES.values():
+        if role.edits_canon:
+            assert role.watch_excludes == ()
+        for excl in role.watch_excludes:
+            assert any(excl.startswith(p) for p in orch.NO_EDIT_WATCH_PATHS), excl
+
+
+def test_run_passes_the_roles_watch_excludes_to_the_guard():
+    # The per-role scoping is wiring, not convention: run() must hand each read-only
+    # task's role excludes to the guard, or every role gets the same (wrong) watch.
+    dag = orch.TaskDAG()
+    dag.add(orch.Task("edit-note", "consistency-editor", ("thm.x",), "check"))
+    dag.validate()
+
+    seen: list[tuple] = []
+
+    def recording_guard(**kw):
+        seen.append(kw.get("excludes"))
+        return True, ""
+
+    report = run(dag, RecordingRunner("out"), enforce_no_edits=recording_guard)
+    assert report.ok()
+    assert seen == [orch.ROLES["consistency-editor"].watch_excludes]
 
 
 if __name__ == "__main__":

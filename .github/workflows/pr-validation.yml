@@ -60,6 +60,21 @@ jobs:
       - name: Check capsules are fresh (no LLM call)
         run: python -m tools.capsules --check
 
+      - name: Stream lint (advisory — diff paths vs branch prefix)
+        # WP-D (.docs/TEAM.md): flags a lane-crossing PR for splitting, reading the
+        # same lane table (tools/lanes.py) the interactive PreToolUse hook enforces —
+        # one source of lane truth. Advisory first: exit 0 with ::warning annotations
+        # on the PR checks UI; flip to --strict here once tuned. Runs even when the
+        # gate above failed (always()) — it is diagnostic, like the annotation
+        # comment. github.head_ref is the PR's source branch name (the checkout
+        # itself is a detached merge commit, so the branch must be passed
+        # explicitly); unprefixed branches are skipped with a note, not judged.
+        if: always()
+        run: |
+          python -m tools.lanes --lint \
+            --branch "${{ github.head_ref }}" \
+            --base "origin/${{ github.event.pull_request.base.ref }}"
+
       - name: Generate PR annotation report
         # Runs regardless of whether the gate above passed — the annotation is diagnostic,
         # not another gate, so a reviewer gets it even (especially) when something failed.

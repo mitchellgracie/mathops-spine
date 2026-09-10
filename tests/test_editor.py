@@ -292,6 +292,126 @@ def test_no_edit_guard_watches_expositions_too(tmp_path):
     assert not stray.exists()
 
 
+def test_no_edit_guard_watches_derived_and_extraction_approved(tmp_path):
+    # WP-B hardening (.docs/TEAM.md): the watch is wider than canon/+expositions/ —
+    # hand-written compiled output and a plan pushed past its human gate are
+    # violations too.
+    _init_repo(tmp_path)
+    (tmp_path / "canon").mkdir()
+    (tmp_path / "canon" / ".gitkeep").write_text("")
+    _commit_all(tmp_path)
+
+    capsule = tmp_path / "derived" / "capsules" / "thm.a.md"
+    capsule.parent.mkdir(parents=True)
+    capsule.write_text("a hand-written capsule\n")
+    approved = tmp_path / "extraction" / "approved" / "sneaky-plan.md"
+    approved.parent.mkdir(parents=True)
+    approved.write_text("a plan that skipped triage\n")
+
+    ok, detail = orch.run_no_edit_guard(cwd=tmp_path)
+    assert not ok
+    assert not capsule.exists()
+    assert not approved.exists()
+    # both survive in quarantine
+    salvage = tmp_path / orch.SALVAGE_DIR_NAME
+    assert list(salvage.rglob("thm.a.md")) and list(salvage.rglob("sneaky-plan.md"))
+
+
+def test_no_edit_guard_excludes_spare_the_roles_own_surface_but_nothing_else(tmp_path):
+    # The Consistency Editor's advisory notes are the incident-shaped case: its
+    # legitimate deliverable lives under derived/editor-notes/ while the rest of
+    # derived/ stays watched. The exclude must spare the note and still revert a
+    # capsule written in the same run.
+    _init_repo(tmp_path)
+    (tmp_path / "canon").mkdir()
+    (tmp_path / "canon" / ".gitkeep").write_text("")
+    _commit_all(tmp_path)
+
+    note = tmp_path / "derived" / "editor-notes" / "001--now.md"
+    note.parent.mkdir(parents=True)
+    note.write_text("advisory critique\n")
+
+    excludes = orch.ROLES["consistency-editor"].watch_excludes
+    ok, detail = orch.run_no_edit_guard(cwd=tmp_path, excludes=excludes)
+    assert ok  # only the declared surface is dirty -> clean pass, note untouched
+    assert note.read_text() == "advisory critique\n"
+
+    capsule = tmp_path / "derived" / "capsules" / "thm.a.md"
+    capsule.parent.mkdir(parents=True)
+    capsule.write_text("out-of-surface write\n")
+
+    ok, detail = orch.run_no_edit_guard(cwd=tmp_path, excludes=excludes)
+    assert not ok
+    assert not capsule.exists()                        # the violation is reverted…
+    assert note.read_text() == "advisory critique\n"   # …the deliverable survives
+
+
+def test_no_edit_guard_researcher_surface_is_raw_and_plans_only(tmp_path):
+    # The Researcher's declared surface: raw material and its own extract-plan
+    # output pass clean; everything else still trips.
+    _init_repo(tmp_path)
+    (tmp_path / "canon").mkdir()
+    (tmp_path / "canon" / ".gitkeep").write_text("")
+    _commit_all(tmp_path)
+
+    (tmp_path / "raw" / "sessions").mkdir(parents=True)
+    (tmp_path / "raw" / "sessions" / "attack-notes.md").write_text("a keeper\n")
+    (tmp_path / "extraction" / "plans").mkdir(parents=True)
+    (tmp_path / "extraction" / "plans" / "attack-notes.md").write_text("a plan\n")
+
+    excludes = orch.ROLES["researcher"].watch_excludes
+    ok, _ = orch.run_no_edit_guard(cwd=tmp_path, excludes=excludes)
+    assert ok
+
+    stray = tmp_path / "expositions" / "survey" / "001-direct.md"
+    stray.parent.mkdir(parents=True)
+    stray.write_text("a hand-placed writeup\n")
+    ok, _ = orch.run_no_edit_guard(cwd=tmp_path, excludes=excludes)
+    assert not ok
+    assert not stray.exists()
+    # the researcher's legitimate output was not collateral damage
+    assert (tmp_path / "raw" / "sessions" / "attack-notes.md").exists()
+    assert (tmp_path / "extraction" / "plans" / "attack-notes.md").exists()
+
+
+def test_orchestrated_researcher_writing_canon_is_reverted_and_salvaged(tmp_path):
+    # The WP-B acceptance test (.docs/TEAM.md): the new proposal-only role rides the
+    # existing no-edit guard end-to-end — a researcher task that writes a canon file
+    # fails, the write is undone, and the bytes survive in quarantine.
+    _init_repo(tmp_path)
+    canon_file = tmp_path / "canon" / "statements" / "a.md"
+    canon_file.parent.mkdir(parents=True)
+    original = "---\nid: thm.a\ntype: statement\nname: A\n---\nOriginal body.\n"
+    canon_file.write_text(original)
+    _commit_all(tmp_path)
+
+    sneaky = original + "A 'quick fix' by the researcher role.\n"
+
+    def sneaky_runner(system: str, prompt: str) -> str:
+        canon_file.write_text(sneaky)
+        return "conjectures and connections"
+
+    dag = orch.TaskDAG()
+    dag.add(orch.Task("explore", "researcher", ("thm.a",), "attack the bound"))
+    dag.validate()
+
+    report = orch.run(
+        dag, sneaky_runner,
+        assemble=lambda eid, **kw: "CTX",
+        load_prompt=lambda role: "SYSTEM",
+        check=lambda: (True, ""),
+        enforce_no_edits=functools.partial(orch.run_no_edit_guard, cwd=tmp_path),
+    )
+
+    assert not report.ok()
+    outcome = report.outcomes[0]
+    assert outcome.status == "failed"
+    assert "read-only guard tripped" in outcome.error
+    assert canon_file.read_text() == original  # the edit was undone
+    salvaged = list((tmp_path / orch.SALVAGE_DIR_NAME).rglob("a.md"))
+    assert len(salvaged) == 1 and salvaged[0].read_text() == sneaky
+
+
 def test_orchestrator_run_fails_and_restores_when_a_read_only_role_writes_canon(tmp_path):
     _init_repo(tmp_path)
     canon_file = tmp_path / "canon" / "statements" / "a.md"
