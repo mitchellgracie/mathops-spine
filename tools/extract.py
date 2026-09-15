@@ -3,6 +3,9 @@
     python -m tools.extract plan raw/<file>.md              # Extractor writes a plan
     python -m tools.extract check                           # structural gate on pending plans
     python -m tools.extract apply extraction/plans/<f>.md   # materialize approved findings
+    python -m tools.extract archive extraction/plans/<f>.md # park a superseded pending plan
+    python -m tools.extract restamp extraction/plans/<f>.md # re-stamp source_sha after a
+                                                            # deliberate plan+raw sync
 
 Canon is normally authored *into* the spine; this module is the on-ramp for material
 written outside it — above all, your own writeups of papers (statements, definitions,
@@ -33,8 +36,9 @@ Three deterministic guarantees the human can rely on:
   plan was written. Re-run ``plan`` instead.
 * **Verbatim prose.** The emitted exposition under ``expositions/<collection>/`` is the
   raw prose byte-for-byte, apart from exactly two mechanical transformations: approved
-  anchor phrases become ``[[id]]`` wiki-links (first non-heading occurrence), and a
-  provenance frontmatter block is prepended. Nothing rewrites the author's words.
+  anchor phrases are wrapped as labeled ``[[id|anchor text]]`` wiki-links (first
+  non-heading occurrence — the span itself is kept, so the sentence stays grammatical),
+  and a provenance frontmatter block is prepended. Nothing rewrites the author's words.
 * **Claimed terms.** Every emphasized or multi-word TitleCase term harvested from the
   raw material must be *claimed* — named in canon, covered by a finding, or ruled on
   via an auto-appended pending ``skip`` stub — so a recall miss by the Extractor
@@ -81,6 +85,7 @@ from pathlib import Path
 import frontmatter
 import yaml
 
+from schemas.base import Notation, Relation
 from schemas.registry import model_for_type
 from schemas.relations import relation_spec
 
@@ -91,6 +96,7 @@ from .common import (
     CANON_DIR,
     CAPSULES_DIR,
     EXTRACTION_APPROVED_DIR,
+    EXTRACTION_ARCHIVED_DIR,
     EXTRACTION_PLANS_DIR,
     EXPOSITIONS_DIR,
     RAW_EXTRACTED_DIR,
@@ -186,7 +192,8 @@ confidence: high | medium | low
 evidence:
   - "short verbatim quote from the raw material"
 candidates:                     # closest existing entities you considered, best first
-  - {id: thm.other_bound, why: "same shape, but over a different base field"}
+  - id: thm.other_bound
+    why: same shape, but over a different base field
 entity:                         # create only: full frontmatter EXCEPT id/type
   name: Example bound
   kind: theorem
@@ -223,6 +230,11 @@ Rules:
   source; propose a separate `proof` create (a sketch body + `uses:` listing what the
   paper's argument invokes) when the material shows the proof's structure — that is
   what makes the dependency graph complete. Never `proved_here` for literature results.
+- Every proof finding states `completeness:` EXPLICITLY — complete | sketch | gap —
+  judged from the source's own signals ("we sketch", "details are left to the reader",
+  "the full argument appears in [X]"). Never lean on the schema default: an omitted
+  `completeness` files a sketched proof as complete, and the triager never saw the
+  choice being made.
 - `anchors` must be verbatim substrings of the raw prose occurring outside `#` heading
   lines, and no two findings may claim the same anchor. Give every create/match/update
   finding at least one anchor when the raw prose refers to it — unless the task marks
@@ -281,6 +293,41 @@ Rules:
   under `entity:` — because a create carries its facts woven into `body:` prose
   instead; a create finding with leftover facts needs a longer body, not a notes
   list."""
+
+
+def _record_fields(model_cls) -> str:
+    """One-line field roster for an embedded record type, read off the Pydantic model.
+
+    The plan prompt embeds these so the model sees the REAL field names (observed
+    failure: every proposed notation entry guessed `meaning` where the schema says
+    `denotes`, and each one failed schema validation). Introspection rather than
+    hand-maintained prose keeps the contract from drifting when a field is renamed —
+    the schema stays the single source of truth.
+    """
+    parts = [name if f.is_required() else f"{name} (optional)"
+             for name, f in model_cls.model_fields.items()]
+    return ", ".join(parts)
+
+
+def _embedded_records_section() -> str:
+    """The contract's embedded-record schema appendix, built at import time."""
+    return f"""
+
+# Embedded record fields (from the schema — use EXACTLY these key names)
+
+- a `notation:` entry has: {_record_fields(Notation)}
+- a `relations:` entry has: {_record_fields(Relation)}
+
+One notation entry, written block-style (one key per line; plain scalars keep LaTeX
+backslashes as-is — never a quoted `{{...}}` flow mapping):
+
+notation:
+  - symbol: $x \\parallel y$
+    denotes: incomparability of two elements of a poset
+    notes: within a fixed ambient poset $P$"""
+
+
+PLAN_TEMPLATE_CONTRACT += _embedded_records_section()
 
 
 # --- plan parsing --------------------------------------------------------------
@@ -447,6 +494,62 @@ def _ensure_pending_decisions(body: str) -> tuple[str, int]:
     return _FINDING_RE.sub(_fill, body), filled
 
 
+class _PlanDumper(yaml.SafeDumper):
+    """Block-style YAML for plan finding blocks (see _restyle_findings).
+
+    Same two moves as tools.fmt's canon dumper — indented block sequences, literal `|`
+    blocks for multi-line strings — because a plan is the same kind of surface: YAML a
+    human edits by hand. It differs in one deliberate way: default_flow_style is False
+    at the call site, so nested mappings (notation entries, candidates) also go block,
+    where fmt keeps canon's inline `- {type: ..., target: ...}` relation style. Plan
+    entries carry LaTeX; canon relations carry ids.
+    """
+
+    def increase_indent(self, flow=False, indentless=False):  # noqa: D401
+        return super().increase_indent(flow, False)
+
+
+def _plan_str_representer(dumper: _PlanDumper, data: str):
+    if "\n" in data:
+        return dumper.represent_scalar("tag:yaml.org,2002:str", data, style="|")
+    return dumper.represent_scalar("tag:yaml.org,2002:str", data)
+
+
+_PlanDumper.add_representer(str, _plan_str_representer)
+
+
+def _restyle_findings(body: str) -> tuple[str, int]:
+    r"""Re-emit every parseable finding block as block-style YAML with plain scalars.
+
+    Plans are a *human editing surface*: triage routinely rewrites statements and
+    notation by hand, and the model's habitual flow mappings with double-quoted scalars
+    (`- {symbol: "$x \\parallel y$", ...}`) force YAML escape rules onto every LaTeX
+    edit (`\\leq`, not `\leq`) — a field-tested source of silently broken findings.
+    Block style with plain/literal scalars needs no escaping, matching how tools.fmt
+    styles canon frontmatter. A pure restyle: each block is parsed and re-dumped, so
+    values are untouched; a block that doesn't parse is left byte-identical for
+    structural_problems to report. Returns (body, blocks restyled).
+    """
+    restyled = 0
+
+    def _restyle(m: re.Match) -> str:
+        nonlocal restyled
+        try:
+            data = yaml.safe_load(m.group(1))
+        except yaml.YAMLError:
+            return m.group(0)
+        if not isinstance(data, dict):
+            return m.group(0)
+        dumped = yaml.dump(data, Dumper=_PlanDumper, sort_keys=False,
+                           default_flow_style=False, allow_unicode=True, width=4096)
+        out = f"```yaml\n{dumped}```"
+        if out != m.group(0):
+            restyled += 1
+        return out
+
+    return _FINDING_RE.sub(_restyle, body), restyled
+
+
 def _scene_text(meta: dict, body: str) -> str:
     """An expositions/ file: YAML frontmatter (tags + provenance) then verbatim prose.
 
@@ -598,7 +701,12 @@ def finding_problems(f: Finding, *, canon: Canon, created_ids: set[str],
             p.append(f"{f.label}: id prefix {prefix!r} does not match type "
                      f"{f.type!r} (expected {model.id_prefix!r})")
         if f.id in canon.entities:
-            p.append(f"{f.label}: id already exists in canon — use match/update, not create")
+            # Names the remedy because this is the canonical way a plan goes stale:
+            # another plan applied first and landed the id this one still creates.
+            p.append(f"{f.label}: id already exists in canon — use match/update, not "
+                     f"create (a plan overtaken by another apply can be regenerated "
+                     f"with `plan --force`, or parked with `make archive-plan "
+                     f"PLAN=...`)")
         for reserved in ("id", "type"):
             if reserved in f.entity:
                 p.append(f"{f.label}: entity block must not set {reserved!r}")
@@ -646,6 +754,12 @@ def finding_problems(f: Finding, *, canon: Canon, created_ids: set[str],
         for anchor in f.anchors:
             if not isinstance(anchor, str) or not anchor:
                 p.append(f"{f.label}: anchor must be a non-empty string, got {anchor!r}")
+                continue
+            if "]]" in anchor:
+                # The anchored span becomes the label of a [[id|label]] wiki-link on
+                # apply; a literal ]] inside it would close the link early.
+                p.append(f"{f.label}: anchor {anchor!r} contains ']]' and cannot be "
+                         f"wrapped in a [[id|...]] wiki-link — shorten the anchor")
                 continue
             other = claimed_anchors.get(anchor)
             if other and other != f.label:
@@ -1075,9 +1189,13 @@ def make_plan(
 
     `runner` is the injected `(system, prompt) -> text` backend — the one LLM call in
     the pipeline. Everything else here is deterministic scaffolding: hint parsing, the
-    candidate index, the string pre-match, frontmatter, and an immediate advisory
-    re-parse of what the model produced (warnings only — the human is about to read the
-    plan anyway; `apply` is where problems become refusals).
+    candidate index, the string pre-match, frontmatter, and normalization of what the
+    model produced (missing decisions filled, finding blocks restyled to edit-safe
+    block YAML). The plan is always written — an LLM run is never discarded over a
+    fixable finding — but it is NOT validated here: the CLI immediately runs
+    `check_plans` on the fresh plan and fails the command if the gate would refuse it,
+    so a schema-invalid proposal is a hard failure at generation time, not a WARN a
+    triager can scroll past.
     """
     root = Path(root)
     raw_path = Path(raw_file) if Path(raw_file).is_absolute() else root / raw_file
@@ -1197,6 +1315,7 @@ def make_plan(
     if filled:
         pre_warnings.append(f"model omitted `decision:` on {filled} finding(s); "
                             "normalized to pending")
+    body, _ = _restyle_findings(body)
 
     # Claim check: every harvested term the model's findings don't cover becomes a
     # pending skip stub the human must rule on — the recall complement of the plan's
@@ -1226,17 +1345,11 @@ def make_plan(
     dest.write_text(_plan_text(meta, f"# Extraction plan: {source_rel}\n\n{body.strip()}"))
 
     plan = parse_plan(dest)
-    warnings = pre_warnings + plan.structural_problems
-    claimed: dict[str, str] = {}
-    created_ids = {f.id for f in plan.findings if f.action == "create" and f.id}
-    for f in plan.findings:
-        warnings += finding_problems(f, canon=canon, created_ids=created_ids,
-                                     prose=prose if kind_emits_exposition(kind) else None,
-                                     claimed_anchors=claimed)
-    for w in warnings:
+    for w in pre_warnings:
         print(f"WARN  {w}", file=sys.stderr)
-    print(f"wrote {dest} ({len(plan.findings)} finding(s), {len(warnings)} warning(s)). "
-          f"Triage every finding's decision, then `make extract-apply PLAN={dest}`.")
+    print(f"wrote {dest} ({len(plan.findings)} finding(s), "
+          f"{len(pre_warnings)} warning(s)). Triage every finding's decision, then "
+          f"`make extract-apply PLAN={dest}`.")
     return dest
 
 
@@ -1251,12 +1364,16 @@ def _next_scene_number(scenes_dir: Path) -> int:
 def emit_exposition(prose: str, *, collection: str, title: str, links: list[tuple[str, str]],
                expositions_dir: Path, meta: dict) -> Path:
     """Write the raw prose as a scene: `meta` as frontmatter, then the prose verbatim
-    except anchors -> ``[[id]]``.
+    except anchors -> ``[[id|anchor]]``.
 
-    Spans are located on the pristine prose and spliced back-to-front, so earlier
-    replacements can never shift or corrupt later ones and an inserted id can never
-    itself be matched as an anchor. Overlaps and missing anchors were refused during
-    validation; hitting one here is a bug, hence the hard error. `meta` carries the
+    Link, don't replace: the anchored span stays in the prose as the link's label, so
+    a long anchor ("An *example term* is a pair $(X,\\leq)$") keeps its sentence
+    grammatical instead of collapsing to a bare id (a field-tested regression: the
+    sentence lost its subject). Spans are located on the pristine prose and spliced
+    back-to-front, so earlier replacements can never shift or corrupt later ones and
+    an inserted id can never itself be matched as an anchor. Overlaps and missing
+    anchors were refused during validation; hitting one here is a bug, hence the hard
+    error. `meta` carries the
     scene's tags and provenance (extracted_from / source_sha / plan) — the successor to
     the old HTML-comment marker, now machine-readable frontmatter (see `_scene_text`).
     """
@@ -1272,7 +1389,7 @@ def emit_exposition(prose: str, *, collection: str, title: str, links: list[tupl
             raise ValueError("overlapping anchor spans")
     text = prose
     for start, end, eid in reversed(spans):
-        text = f"{text[:start]}[[{eid}]]{text[end:]}"
+        text = f"{text[:start]}[[{eid}|{text[start:end]}]]{text[end:]}"
 
     coll_dir = Path(expositions_dir) / collection
     coll_dir.mkdir(parents=True, exist_ok=True)
@@ -1321,7 +1438,9 @@ def apply_plan(
     elif plan.meta.get("source_sha") and \
             source_hash(raw_path.read_bytes()) != plan.meta["source_sha"]:
         problems.append("stale plan: the raw material changed since this plan was "
-                        "written — regenerate with `plan --force`")
+                        "written — regenerate with `plan --force` (or, only after a "
+                        "deliberate, reviewed plan+raw sync, `python -m tools.extract "
+                        "restamp`)")
     undecided = [f.label for f in plan.findings if f.decision == "pending"]
     if undecided:
         problems.append("undecided finding(s): " + ", ".join(undecided) +
@@ -1514,10 +1633,89 @@ def _ensure_reciprocity(touched: dict[str, Path], canon: Canon) -> list[tuple[st
     return added
 
 
+# --- pending-plan lifecycle (archive / restamp; no LLM) ------------------------------
+
+def archive_plan(plan_file: str, *, root: Path = ROOT,
+                 archived_dir: Path = EXTRACTION_ARCHIVED_DIR) -> int:
+    """Park a pending plan in extraction/archived/ — the superseded-plan lifecycle op.
+
+    Superseding is a normal outcome, not an error: a plan drafted against an earlier
+    canon state becomes unappliable once another plan lands first (its `create`s now
+    collide), and the only remedies are a full `plan --force` regeneration (an LLM run)
+    or parking the plan. Parking used to be a hand `git mv`; like the entity lifecycle
+    ops, it should be a tool action. The move is byte-identical — no status stamp — so
+    un-parking is the symmetric move back to extraction/plans/, and the archived file
+    remains an honest record of what the Extractor proposed and the triager saw.
+    """
+    root = Path(root)
+    plan_path = Path(plan_file) if Path(plan_file).is_absolute() else root / plan_file
+    if not plan_path.exists():
+        print(f"no such plan: {plan_path}")
+        return 1
+    plan = parse_plan(plan_path)
+    if plan.meta.get("status") == "applied":
+        print(f"refusing to archive {plan_path.name}: the plan is applied — "
+              "extraction/approved/ is its audit trail, not archived/")
+        return 1
+    dest = Path(archived_dir) / plan_path.name
+    if dest.exists():
+        print(f"refusing to archive: destination already exists: {dest}")
+        return 1
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    plan_path.rename(dest)
+
+    def _rel(p: Path) -> str:
+        try:
+            return p.relative_to(root).as_posix()
+        except ValueError:
+            return str(p)
+
+    print(f"archived {_rel(plan_path)} -> {_rel(dest)} (regenerate with "
+          f"`python -m tools.extract plan {plan.meta.get('source', '<raw file>')} "
+          f"--force` if the material still matters)")
+    return 0
+
+
+def restamp_plan(plan_file: str, *, root: Path = ROOT) -> int:
+    """Re-stamp a pending plan's `source_sha` to the raw file's current hash.
+
+    The plan-side twin of `tools.capsules --restamp`, with the same contract: it is for
+    after a *deliberate, reviewed* sync of plan and source — triage amendments copied
+    back into the raw file so the two stay consistent — never to silence real drift.
+    The staleness gate exists so apply can't materialize findings transcribed from text
+    that has since changed; restamping asserts, on the human's authority, that the
+    findings are still faithful to the raw file as it now reads.
+    """
+    root = Path(root)
+    plan_path = Path(plan_file) if Path(plan_file).is_absolute() else root / plan_file
+    if not plan_path.exists():
+        print(f"no such plan: {plan_path}")
+        return 1
+    plan = parse_plan(plan_path)
+    if plan.meta.get("status") == "applied":
+        print(f"refusing to restamp {plan_path.name}: the plan is applied; its "
+              "source_sha is a historical record now")
+        return 1
+    raw_path = root / str(plan.meta.get("source", ""))
+    if not raw_path.exists():
+        print(f"raw source missing: {plan.meta.get('source')!r} — nothing to stamp against")
+        return 1
+    current = source_hash(raw_path.read_bytes())
+    if plan.meta.get("source_sha") == current:
+        print(f"{plan_path.name} is already stamped to the current raw hash; nothing to do.")
+        return 0
+    plan_path.write_text(_plan_text({**plan.meta, "source_sha": current}, plan.body))
+    print(f"restamped {plan_path.name} -> source_sha {current}")
+    print("HAZARD: this declares every finding still faithful to the raw file as it "
+          "now reads. Only for a deliberate, reviewed plan+raw sync — if the material "
+          "genuinely changed, regenerate with `plan --force` instead.")
+    return 0
+
+
 # --- check (a gate leg: make check + CI, and the standalone triage aid) -------------
 
 def check_plans(*, plans_dir: Path = EXTRACTION_PLANS_DIR, root: Path = ROOT,
-                canon: Canon | None = None) -> int:
+                canon: Canon | None = None, paths: list[Path] | None = None) -> int:
     """Structurally validate every pending plan; report all problems at once.
 
     Runs as a leg of `make check`/CI (as well as standalone): a committed plan is a
@@ -1527,10 +1725,15 @@ def check_plans(*, plans_dir: Path = EXTRACTION_PLANS_DIR, root: Path = ROOT,
     advisories (finding_advisories) never do — they exist so triage sees what an
     omitted defaulted field will silently materialize as, and a plan that leans on
     defaults on purpose still gates green. Plans parked on purpose belong in
-    extraction/archived/, which this function never reads.
+    extraction/archived/ (`make archive-plan`), which this function never reads.
+
+    `paths` narrows the check to specific plan files: the `plan` CLI runs it on the
+    plan it just wrote, so generation and the gate share one validation code path and
+    one report format (parity a triager can rely on after hand-edits, too).
     """
-    plans_dir = Path(plans_dir)
-    paths = sorted(plans_dir.glob("*.md")) if plans_dir.exists() else []
+    if paths is None:
+        plans_dir = Path(plans_dir)
+        paths = sorted(plans_dir.glob("*.md")) if plans_dir.exists() else []
     if not paths:
         print("no pending plans.")
         return 0
@@ -1550,7 +1753,9 @@ def check_plans(*, plans_dir: Path = EXTRACTION_PLANS_DIR, root: Path = ROOT,
                     source_hash(raw_path.read_bytes()) != plan.meta["source_sha"]:
                 problems.append(
                     "stale: raw material changed since the plan was written — "
-                    "re-plan, or move a deliberately parked plan to extraction/archived/")
+                    "regenerate with `plan --force`, park it with `make archive-plan "
+                    "PLAN=...`, or (only after a deliberate, reviewed plan+raw sync) "
+                    "`python -m tools.extract restamp`")
             # Claim check re-runs against the plan as triaged: a stub the human deleted
             # (instead of ruling on) resurfaces here, as does any term left uncovered in
             # a plan written before the claim check existed or authored by hand.
@@ -1602,15 +1807,36 @@ def main(argv: list[str] | None = None) -> int:
 
     sub.add_parser("check", help="structurally validate pending plans (no LLM)")
 
+    p_arch = sub.add_parser(
+        "archive", help="park a superseded pending plan in extraction/archived/ (no LLM)")
+    p_arch.add_argument("plan", help="path to an extraction/plans/ file")
+
+    p_restamp = sub.add_parser(
+        "restamp", help="re-stamp a pending plan's source_sha after a deliberate, "
+                        "reviewed plan+raw sync (no LLM; never to silence real drift)")
+    p_restamp.add_argument("plan", help="path to an extraction/plans/ file")
+
     args = ap.parse_args(argv)
     if args.cmd == "plan":
         runner = make_runner(args.backend, model=args.model,
                              max_tokens=EXTRACT_MAX_TOKENS, timeout=EXTRACT_CLI_TIMEOUT)
-        return 0 if make_plan(args.raw, runner=runner, force=args.force) else 1
+        dest = make_plan(args.raw, runner=runner, force=args.force)
+        if dest is None:
+            return 1
+        # Failure posture: a freshly written plan the gate would refuse fails THIS
+        # command too. These used to be per-finding WARNs on stderr — exactly the kind
+        # of console output a triager misses on a long plan. The plan stays on disk
+        # (the LLM run is never discarded); the exit code and FAIL report say that
+        # findings need fixing before triage.
+        return check_plans(paths=[dest])
     if args.cmd == "apply":
         return apply_plan(args.plan, scene=not args.no_exposition)
     if args.cmd == "check":
         return check_plans()
+    if args.cmd == "archive":
+        return archive_plan(args.plan)
+    if args.cmd == "restamp":
+        return restamp_plan(args.plan)
     return 1
 
 

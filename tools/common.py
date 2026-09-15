@@ -42,6 +42,9 @@ RAW_EXTRACTED_DIR = RAW_DIR / "extracted"
 EXTRACTION_DIR = ROOT / "extraction"
 EXTRACTION_PLANS_DIR = EXTRACTION_DIR / "plans"
 EXTRACTION_APPROVED_DIR = EXTRACTION_DIR / "approved"
+# Superseded plans that were never applied — parked by `tools.extract archive` (or a
+# deliberate git mv) so the pending queue stays green without losing the audit trail.
+EXTRACTION_ARCHIVED_DIR = EXTRACTION_DIR / "archived"
 # Records the schema version the canon on disk is at (see tools.migrate). Kept out of
 # canon/ so it never interacts with entity loading.
 SCHEMA_VERSION_FILE = ROOT / ".schema-version"

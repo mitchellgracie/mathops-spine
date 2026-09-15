@@ -445,9 +445,12 @@ def test_exposition_is_verbatim_plus_links_and_frontmatter(tmp_path):
     assert post.metadata["plan"] == "extraction/approved/chapter.md"
     assert post.metadata["source_sha"]                 # provenance hash carried over
     assert "tags" not in post.metadata                 # untagged material -> no tags key
+    # Link, don't replace: the anchored span survives as the link label, so the
+    # sentence stays grammatical (a bare [[id]] used to swallow its subject).
     expected = RAW_PROSE.replace(
         "The Base Bound gives the Sharp Bound",
-        "The [[thm.base_bound]] gives the [[thm.sharp_bound]]").strip()
+        "The [[thm.base_bound|Base Bound]] gives the [[thm.sharp_bound|Sharp Bound]]",
+    ).strip()
     assert post.content.strip() == expected            # prose verbatim apart from the links
 
     expositions = load_expositions(tmp_path / "expositions")
@@ -521,19 +524,27 @@ def test_make_plan_fills_missing_decisions(tmp_path):
     assert not plan.structural_problems
 
 
-def test_cli_plan_forwards_force(tmp_path, monkeypatch):
+def test_cli_plan_forwards_force_and_gates_on_check(tmp_path, monkeypatch):
     """Regression: `extract plan --force` parsed the flag but never passed it on,
-    so a regeneration silently refused and the stale plan stayed in place."""
+    so a regeneration silently refused and the stale plan stayed in place. Also pins
+    the failure posture: the CLI runs check_plans on the plan it just wrote and its
+    exit code IS the check's — plan-time schema problems must not be scroll-past WARNs."""
     captured = {}
 
     def fake_make_plan(raw, *, runner, force=False):
         captured["force"] = force
         return Path(raw)
 
+    def fake_check_plans(*, paths=None, **kwargs):
+        captured["checked"] = paths
+        return 3
+
     monkeypatch.setattr(ex, "make_plan", fake_make_plan)
+    monkeypatch.setattr(ex, "check_plans", fake_check_plans)
     monkeypatch.setattr(ex, "make_runner", lambda *a, **k: None)
-    assert ex.main(["plan", "raw/x.md", "--force"]) == 0
+    assert ex.main(["plan", "raw/x.md", "--force"]) == 3
     assert captured["force"] is True
+    assert captured["checked"] == [Path("raw/x.md")]
 
 
 def test_make_plan_refuses_to_clobber_pending_plan(tmp_path):
@@ -963,3 +974,222 @@ def test_compound_canon_name_claims_its_parts(tmp_path):
     canon = load_canon(cd)
     prose = "The pairing honoured *Mann* and *Umirn*, as *Mann* demands.\n"
     assert ex.unclaimed_terms(prose, [], canon) == []
+
+
+# --- prompt contract: embedded record schemas + explicit completeness ------------------
+
+def test_contract_embeds_real_record_field_names():
+    # Field-tested Extractor failure: every notation entry guessed {symbol, meaning}
+    # where the schema says {symbol, denotes}. The contract now carries the field
+    # roster introspected from the models, so a rename can't leave the prompt lying.
+    assert "a `notation:` entry has: symbol, denotes, notes (optional)" \
+        in ex.PLAN_TEMPLATE_CONTRACT
+    assert "a `relations:` entry has: type, target, note (optional)" \
+        in ex.PLAN_TEMPLATE_CONTRACT
+    # and a literal block-style example the model can imitate
+    assert "denotes: incomparability of two elements of a poset" \
+        in ex.PLAN_TEMPLATE_CONTRACT
+
+
+def test_contract_demands_explicit_proof_completeness():
+    # The advisory note in check is the backstop for hand-written plans; the Extractor
+    # itself is instructed to always state completeness, so the note stops firing on
+    # every gate run for every generated proof finding.
+    assert "complete | sketch | gap" in ex.PLAN_TEMPLATE_CONTRACT
+    assert "`completeness:` EXPLICITLY" in ex.PLAN_TEMPLATE_CONTRACT
+
+
+def test_record_fields_tracks_the_schema():
+    from schemas.base import Notation
+    assert ex._record_fields(Notation) == "symbol, denotes, notes (optional)"
+
+
+# --- check re-validates proposed entities (triage hand-edits included) ------------------
+
+FINDING_BAD_NOTATION = """
+### Example Term
+```yaml
+action: create
+type: definition
+id: def.example_term
+evidence: ["The Base Bound gives the Sharp Bound at once."]
+entity:
+  name: Example term
+  notation:
+    - {symbol: parallel-sign, meaning: incomparability}
+decision: pending
+```
+"""
+
+
+def test_check_plans_fails_wrong_notation_field_names(tmp_path, capsys):
+    # The triage gate is hand-editing; a plan whose proposed entities no longer
+    # validate (here: a Notation entry with `meaning` instead of `denotes`) must FAIL
+    # extract-check with the per-finding schema error, not surface at apply time.
+    cd = base_world(tmp_path)
+    canon = load_canon(cd)
+    write_plan(tmp_path, FINDING_CREATE, FINDING_MATCH, FINDING_BAD_NOTATION)
+    assert ex.check_plans(plans_dir=tmp_path / "extraction" / "plans",
+                          root=tmp_path, canon=canon) == 1
+    out = capsys.readouterr().out
+    assert "def.example_term" in out
+    assert "fails the schema" in out
+
+
+def test_check_plans_paths_narrows_to_given_plans(tmp_path):
+    # `paths` is how the plan CLI gates the one plan it just wrote, sharing this exact
+    # code path — so generation-time and gate-time validation cannot drift apart.
+    cd = base_world(tmp_path)
+    canon = load_canon(cd)
+    good = write_plan(tmp_path, FINDING_CREATE, FINDING_MATCH)
+    assert ex.check_plans(root=tmp_path, canon=canon, paths=[good]) == 0
+    bad = good.parent / "bad.md"
+    bad.write_text(good.read_text().replace("action: create", "action: conjure"))
+    assert ex.check_plans(root=tmp_path, canon=canon, paths=[bad]) == 1
+    # the bad sibling is invisible when paths points only at the good plan
+    assert ex.check_plans(root=tmp_path, canon=canon, paths=[good]) == 0
+
+
+def test_create_collision_message_names_the_remedy(tmp_path, capsys):
+    # A plan overtaken by another apply fails correctly, but the failure must SAY the
+    # remedy (regenerate with --force, or park via archive-plan) — the field-tested
+    # alternative was a hand git mv discovered by spelunking.
+    cd = base_world(tmp_path)
+    canon = load_canon(cd)
+    collided = FINDING_CREATE.replace("id: thm.sharp_bound", "id: thm.base_bound")
+    write_plan(tmp_path, collided, FINDING_MATCH)
+    assert ex.check_plans(plans_dir=tmp_path / "extraction" / "plans",
+                          root=tmp_path, canon=canon) == 1
+    out = capsys.readouterr().out
+    assert "plan --force" in out
+    assert "make archive-plan" in out
+
+
+# --- plan restyle: block YAML, edit-safe during triage ----------------------------------
+
+FLOW_STYLE_FINDING = (
+    "### Example Term\n"
+    "```yaml\n"
+    "action: create\n"
+    "type: definition\n"
+    "id: def.example_term\n"
+    'evidence: ["The Base Bound gives the Sharp Bound at once."]\n'
+    'entity: {name: Example term, notation: [{symbol: "$x \\\\parallel y$", '
+    'denotes: "incomparability"}]}\n'
+    'anchors: ["Sharp Bound"]\n'
+    "decision: pending\n"
+    "```\n"
+)
+
+
+def test_make_plan_restyles_findings_to_block_yaml(tmp_path):
+    """Plans are a hand-editing surface during triage: finding blocks are re-emitted as
+    block-style YAML with plain scalars, so a LaTeX edit needs no double-quote escaping
+    (`\\leq`, not `\\\\leq` — the field-tested way three findings broke)."""
+    cd = base_world(tmp_path)
+    canon = load_canon(cd)
+    runner = lambda s, p: "## Summary\nx\n\n## Findings\n" + FLOW_STYLE_FINDING
+    dest = ex.make_plan("raw/chapter.md", runner=runner, canon=canon, root=tmp_path,
+                        plans_dir=tmp_path / "extraction" / "plans")
+    text = dest.read_text()
+    assert "entity: {" not in text                       # no flow mappings to hand-edit
+    assert "symbol: $x \\parallel y$" in text            # plain scalar, single backslash
+    assert '"$x \\\\parallel y$"' not in text            # the escaped form is gone
+    # a pure restyle: parsed values are byte-identical to what the model proposed
+    plan = ex.parse_plan(dest)
+    assert plan.findings[0].entity["notation"][0]["symbol"] == "$x \\parallel y$"
+
+
+def test_restyle_findings_leaves_broken_blocks_alone():
+    body = "```yaml\naction: [unclosed\n```\n"
+    out, restyled = ex._restyle_findings(body)
+    assert out == body and restyled == 0
+
+
+def test_restyle_findings_emits_literal_blocks_for_multiline():
+    body = ('```yaml\n'
+            'action: create\n'
+            'entity: {statement: "Let $X$ be a poset.\\nThen $\\\\dim X \\\\le n$."}\n'
+            'decision: pending\n'
+            '```\n')
+    out, restyled = ex._restyle_findings(body)
+    assert restyled == 1
+    assert "statement: |-" in out                        # literal block, LaTeX readable
+    assert "\\dim X \\le n" in out
+
+
+# --- plan lifecycle: archive + restamp ---------------------------------------------------
+
+def test_archive_plan_moves_pending_plan_byte_identical(tmp_path):
+    base_world(tmp_path)
+    plan = write_plan(tmp_path, FINDING_CREATE, FINDING_MATCH)
+    original = plan.read_text()
+    archived_dir = tmp_path / "extraction" / "archived"
+    assert ex.archive_plan(plan, root=tmp_path, archived_dir=archived_dir) == 0
+    assert not plan.exists()
+    # a pure move, no status stamp: un-parking is the symmetric move back
+    assert (archived_dir / "chapter.md").read_text() == original
+
+
+def test_archive_plan_refuses_applied_missing_and_clobber(tmp_path):
+    base_world(tmp_path)
+    archived_dir = tmp_path / "extraction" / "archived"
+    assert ex.archive_plan(tmp_path / "extraction" / "plans" / "nope.md",
+                           root=tmp_path, archived_dir=archived_dir) == 1
+    applied = write_plan(tmp_path, FINDING_CREATE,
+                         meta_overrides={"status": "applied"})
+    assert ex.archive_plan(applied, root=tmp_path, archived_dir=archived_dir) == 1
+    assert applied.exists()                              # refused, not moved
+    applied.unlink()
+    plan = write_plan(tmp_path, FINDING_CREATE)
+    archived_dir.mkdir(parents=True)
+    (archived_dir / "chapter.md").write_text("already parked\n")
+    assert ex.archive_plan(plan, root=tmp_path, archived_dir=archived_dir) == 1
+    assert plan.exists()
+
+
+def test_restamp_plan_after_deliberate_sync(tmp_path, capsys):
+    # The plan-side twin of capsules --restamp: after triage amendments are synced back
+    # into the raw source on purpose, restamp re-stamps source_sha so apply accepts the
+    # pair again — body and decisions untouched, and the hazard stated loudly.
+    base_world(tmp_path)
+    plan = write_plan(tmp_path, FINDING_CREATE, FINDING_MATCH)
+    raw = tmp_path / "raw" / "chapter.md"
+    raw.write_text(RAW_PROSE)                            # byte-identical rewrite first
+    assert ex.restamp_plan(plan, root=tmp_path) == 0
+    assert "nothing to do" in capsys.readouterr().out    # fresh plan: no-op
+
+    raw.write_text(RAW_PROSE + "\nAn amended closing line.\n")
+    assert run_apply(tmp_path, plan) == 1                # stale: apply refuses
+    assert ex.restamp_plan(plan, root=tmp_path) == 0
+    out = capsys.readouterr().out
+    assert "HAZARD" in out and "deliberate, reviewed" in out
+    reread = ex.parse_plan(plan)
+    assert reread.meta["source_sha"] == ex.source_hash(raw.read_bytes())
+    assert [f.decision for f in reread.findings] == ["approved", "approved"]
+    assert run_apply(tmp_path, plan) == 0                # the pair is whole again
+
+
+def test_restamp_plan_refuses_applied_and_missing_raw(tmp_path):
+    base_world(tmp_path)
+    applied = write_plan(tmp_path, FINDING_CREATE,
+                         meta_overrides={"status": "applied"})
+    assert ex.restamp_plan(applied, root=tmp_path) == 1
+    applied.unlink()
+    orphan = write_plan(tmp_path, FINDING_CREATE,
+                        meta_overrides={"source": "raw/gone.md"})
+    assert ex.restamp_plan(orphan, root=tmp_path) == 1
+
+
+# --- labeled wiki-links ------------------------------------------------------------------
+
+def test_check_refuses_anchor_containing_link_closer(tmp_path):
+    base_world(tmp_path)
+    (tmp_path / "raw" / "chapter.md").write_text(
+        RAW_PROSE.replace("Sharp Bound at once", "Sharp Bound ]] at once"))
+    bad = FINDING_CREATE.replace('anchors: ["Sharp Bound"]',
+                                 'anchors: ["Sharp Bound ]] at once"]')
+    plan = write_plan(tmp_path, bad, FINDING_MATCH)
+    canon = load_canon(tmp_path / "canon")
+    assert ex.check_plans(plans_dir=tmp_path / "extraction" / "plans",
+                          root=tmp_path, canon=canon) == 1

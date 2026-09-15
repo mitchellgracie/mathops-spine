@@ -144,3 +144,13 @@ if __name__ == "__main__":
     import pytest
 
     raise SystemExit(pytest.main([__file__, "-q"]))
+
+
+def test_mentions_include_labeled_wiki_links():
+    # extract-apply emits [[id|anchor text]]; the id must index exactly like a bare
+    # [[id]] link, whatever the label holds (LaTeX pipes, brackets, a hard line-wrap).
+    exp = Exposition("expositions/s/001-x.md", (
+        "See [[thm.a|the bound $|x|\\le 1$ on $[0,1]$]] and\n"
+        "[[def.pair|a pair\n$(X,\\leq)$]] beside plain [[src.paper]].\n"
+    ))
+    assert exp.mentions == ["def.pair", "src.paper", "thm.a"]
