@@ -57,7 +57,12 @@ class Inbound:
 
 
 def _mention_link_re(entity_id: str) -> re.Pattern:
-    return re.compile(r"\[\[" + re.escape(entity_id) + r"\]\]")
+    # Matches both `[[id]]` and labeled `[[id|display text]]` (same grammar as
+    # expositions.MENTION_RE, anchored to one id). Group 1 captures the `|label` part
+    # — always present as a group, possibly empty — so a retargeting sub() can carry
+    # the human-facing label over to the new id untouched.
+    return re.compile(r"\[\[" + re.escape(entity_id) +
+                      r"((?:\|(?:(?!\]\])[\s\S])*)?)\]\]")
 
 
 def inbound_references(canon: Canon, target_id: str, *,
@@ -215,7 +220,7 @@ def _retarget_file(path: Path, old: str, new: str) -> bool:
     post = frontmatter.load(path)
     meta = dict(post.metadata)
     changed = _retarget_meta(meta, old, new)
-    body = _mention_link_re(old).sub(f"[[{new}]]", post.content)
+    body = _mention_link_re(old).sub(lambda m: f"[[{new}{m.group(1)}]]", post.content)
     if body != post.content:
         changed = True
     if changed:
@@ -253,7 +258,8 @@ def merge_entities(dup_id: str, canon_id: str, *, canon: Canon | None = None,
     for exp in (load_expositions() if expositions_dir is None
                 else load_expositions(expositions_dir)):
         xpath = (canon_dir.parent / exp.path)
-        new_body = _mention_link_re(dup_id).sub(f"[[{canon_id}]]", exp.body)
+        new_body = _mention_link_re(dup_id).sub(
+            lambda m: f"[[{canon_id}{m.group(1)}]]", exp.body)
         if new_body != exp.body:
             xpath.write_text(new_body)
             rewritten += 1

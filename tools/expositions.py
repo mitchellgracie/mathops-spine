@@ -31,7 +31,11 @@ from .taxonomy import normalize_tags
 
 # The wiki-link grammar for entity references in prose — the same `<prefix>.<slug>` shape
 # the canon-body mentions index uses (tools.build imports this so there is one regex).
-MENTION_RE = re.compile(r"\[\[([a-z]+\.[a-z0-9_]+)\]\]")
+# Two forms: bare `[[thm.x]]` and labeled `[[thm.x|display text]]` (what extract-apply
+# emits, keeping the anchored span as the label so the sentence stays grammatical). The
+# label may hold anything except a closing `]]` — LaTeX with `|`, brackets, even a hard
+# line-wrap — and only the id is captured, so every consumer indexes both forms alike.
+MENTION_RE = re.compile(r"\[\[([a-z]+\.[a-z0-9_]+)(?:\|(?:(?!\]\])[\s\S])*)?\]\]")
 
 
 @dataclass(frozen=True)

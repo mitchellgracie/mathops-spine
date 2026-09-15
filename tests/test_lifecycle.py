@@ -209,3 +209,29 @@ def test_reference_to_tombstone_is_flagged(tmp_path):
 if __name__ == "__main__":
     import pytest
     raise SystemExit(pytest.main([__file__, "-q"]))
+
+
+def test_merge_retargets_labeled_wiki_links_keeping_labels(tmp_path):
+    # extract-apply emits labeled links ([[id|anchor text]]); a merge must retarget
+    # the id and leave the human-facing label — the prose — untouched, in canon
+    # bodies and expositions alike.
+    cd = base_canon(tmp_path)
+    write(tmp_path, "statements/c.md", """
+        ---
+        id: thm.c
+        type: statement
+        name: C
+        ---
+        Compare [[thm.b|the second bound, $x \\le y$]] with [[thm.b]].
+    """)
+    exp = tmp_path / "expositions" / "survey" / "001-x.md"
+    exp.parent.mkdir(parents=True)
+    exp.write_text("Recall [[thm.b|the *second* bound]] once more.\n")
+
+    assert lc.merge_entities("thm.b", "thm.a", canon_dir=cd,
+                             capsules_dir=tmp_path / "caps",
+                             expositions_dir=tmp_path / "expositions") == 0
+    c_body = (cd / "statements" / "c.md").read_text()
+    assert "[[thm.a|the second bound, $x \\le y$]]" in c_body
+    assert "[[thm.a]]" in c_body and "thm.b" not in c_body
+    assert exp.read_text() == "Recall [[thm.a|the *second* bound]] once more.\n"
