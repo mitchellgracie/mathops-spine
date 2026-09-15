@@ -240,3 +240,5 @@ Match the existing code: type hints, dataclasses/Pydantic over ad hoc dicts, sma
 single-purpose modules in `tools/`, docstrings that explain *why* a design choice was
 made (not just what the code does) — see any existing file in `tools/` or `schemas/`
 for the expected tone and density.
+
+**Prose line-wrapping — semantic grouping, not hard-wrapping.** In any prose you write — notes, drafts, entity bodies, comments, docstrings, commit messages, PR descriptions — break lines at semantic boundaries (one sentence or clause per line) and otherwise let long lines soft-wrap. Never hard-wrap at a column width unless the format truly demands it (e.g. a table, or code inside a fence). Semantic breaks keep diffs meaningful (editing one sentence touches one line, not a reflowed paragraph) and keep prose greppable. Don't mass-reformat existing hard-wrapped text just to conform; apply this to prose you write or substantially rewrite.
